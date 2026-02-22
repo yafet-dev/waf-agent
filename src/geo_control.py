@@ -10,6 +10,12 @@ from pathlib import Path
 from typing import Set, Optional
 from fastapi import HTTPException
 
+# Try relative imports first (when run as module), fallback to absolute (when run directly)
+try:
+    from .config import NGINX_BINARY, SYSTEMCTL_BINARY
+except ImportError:
+    from src.config import NGINX_BINARY, SYSTEMCTL_BINARY
+
 logger = logging.getLogger(__name__)
 
 # ─── Paths ──────────────────────────────────────────────────────────────────
@@ -197,7 +203,7 @@ def validate_and_reload_nginx() -> None:
     try:
         # Test nginx config
         result = subprocess.run(
-            ['nginx', '-t'],
+            [NGINX_BINARY, '-t'],
             capture_output=True,
             text=True,
             timeout=CMD_TIMEOUT
@@ -215,7 +221,7 @@ def validate_and_reload_nginx() -> None:
         
         # Reload nginx
         result = subprocess.run(
-            ['systemctl', 'reload', 'nginx'],
+            [SYSTEMCTL_BINARY, 'reload', 'nginx'],
             capture_output=True,
             text=True,
             timeout=CMD_TIMEOUT
