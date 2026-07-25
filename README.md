@@ -72,6 +72,24 @@ agree on exactly one credential-free case.
 A supplied signature is **always** verified, loopback included — a wrong key is
 never silently ignored, only an absent one is tolerated locally.
 
+### Make the bearer token real
+
+Set `WAF_AGENT_AUTH_TOKEN` on the agent to the same value the backend uses:
+
+```bash
+# /etc/waf-agent/agent.env  (or the systemd unit's Environment=)
+WAF_AGENT_AUTH_TOKEN=the-same-long-random-string-the-backend-sends
+```
+
+**Until you set it, any non-empty token is accepted** and the agent logs a
+warning on every request. That is the historical behaviour, kept so turning
+this on is never a prerequisite for an already-working deployment — but it
+means `/ban` and the geo endpoints are effectively unauthenticated for anyone
+who can reach the port. `/waf/toggle` is still protected by its RSA signature.
+
+Setting it is the single highest-value hardening step for a
+publicly-reachable agent.
+
 Unauthenticated by design: `/health`, `/v1/geo/health`, `/waf/status/{domain}`,
 `/status`, `/v1/geo/status`. These are read-only.
 

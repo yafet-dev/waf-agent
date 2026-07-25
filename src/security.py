@@ -3,6 +3,7 @@ Security and authentication utilities for WAF Agent
 """
 
 import base64
+import hmac
 import ipaddress
 import logging
 import os
@@ -39,6 +40,42 @@ def _is_loopback(host: str) -> bool:
         address = mapped
 
     return address.is_loopback
+
+
+def get_expected_auth_token() -> str:
+    """
+    The bearer token remote callers must present, from WAF_AGENT_AUTH_TOKEN.
+
+    Returns "" when unset, which means the token cannot be checked. See
+    verify_auth_token() for what happens then.
+    """
+    return os.getenv("WAF_AGENT_AUTH_TOKEN", "").strip()
+
+
+def verify_auth_token(presented: str) -> bool:
+    """
+    Check a presented bearer token against the configured one.
+
+    When WAF_AGENT_AUTH_TOKEN is not set the agent cannot tell a real token
+    from a forged one, so any non-empty value is accepted and a warning is
+    logged. That is the historical behaviour, kept so setting this variable on
+    the agent is never a prerequisite for an already-working deployment --
+    but it means the token is decorative until you set it. Set it on the agent
+    and the backend to make it meaningful.
+
+    Uses a constant-time comparison so the token cannot be recovered by timing
+    repeated requests.
+    """
+    expected = get_expected_auth_token()
+
+    if not expected:
+        logger.warning(
+            "WAF_AGENT_AUTH_TOKEN is not set: accepting any bearer token. "
+            "Set it here and on the backend so the token is actually checked."
+        )
+        return True
+
+    return hmac.compare_digest(presented.strip(), expected)
 
 
 def is_trusted_local_request(request) -> bool:

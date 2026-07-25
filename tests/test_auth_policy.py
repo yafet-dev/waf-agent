@@ -173,3 +173,46 @@ def test_missing_signature_is_rejected_when_required():
     with pytest.raises(HTTPException) as excinfo:
         toggle_waf_for_domain("example.com", True, signature=None, require_signature=True)
     assert excinfo.value.status_code == 400
+
+
+# --- bearer token validation ------------------------------------------------
+
+
+def test_wrong_token_is_rejected_when_a_token_is_configured(monkeypatch):
+    monkeypatch.setenv("WAF_AGENT_AUTH_TOKEN", "the-real-token")
+    _PEER["host"] = "196.188.250.141"
+    with patch.object(main, "toggle_waf_for_domain", return_value=TOGGLE_OK):
+        response = _toggle(
+            body={"signature": "abc"}, headers={"Authorization": "Bearer wrong"}
+        )
+    assert response.status_code == 403
+
+
+def test_correct_token_is_accepted(monkeypatch):
+    monkeypatch.setenv("WAF_AGENT_AUTH_TOKEN", "the-real-token")
+    _PEER["host"] = "196.188.250.141"
+    with patch.object(main, "toggle_waf_for_domain", return_value=TOGGLE_OK):
+        response = _toggle(
+            body={"signature": "abc"},
+            headers={"Authorization": "Bearer the-real-token"},
+        )
+    assert response.status_code == 200
+
+
+def test_any_token_accepted_when_none_is_configured(monkeypatch):
+    """Historical behaviour, kept so setting the variable is never a
+    prerequisite for an already-working deployment."""
+    monkeypatch.delenv("WAF_AGENT_AUTH_TOKEN", raising=False)
+    _PEER["host"] = "196.188.250.141"
+    with patch.object(main, "toggle_waf_for_domain", return_value=TOGGLE_OK):
+        response = _toggle(
+            body={"signature": "abc"}, headers={"Authorization": "Bearer anything"}
+        )
+    assert response.status_code == 200
+
+
+def test_token_is_not_required_from_loopback_even_when_configured(monkeypatch):
+    monkeypatch.setenv("WAF_AGENT_AUTH_TOKEN", "the-real-token")
+    _PEER["host"] = "127.0.0.1"
+    with patch.object(main, "toggle_waf_for_domain", return_value=TOGGLE_OK):
+        assert _toggle().status_code == 200

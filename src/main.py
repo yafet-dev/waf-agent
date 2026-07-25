@@ -29,7 +29,7 @@ from typing import List, Optional
 try:
     from .waf_toggle import toggle_waf_for_domain, get_waf_status_for_domain
     from .ip_block import ban_unban_ip, get_ip_block_status
-    from .security import is_trusted_local_request
+    from .security import is_trusted_local_request, verify_auth_token
     from .geo_control import (
         read_list,
         write_list_atomic,
@@ -43,7 +43,7 @@ except ImportError:
     # Fallback to absolute imports when running directly
     from src.waf_toggle import toggle_waf_for_domain, get_waf_status_for_domain
     from src.ip_block import ban_unban_ip, get_ip_block_status
-    from src.security import is_trusted_local_request
+    from src.security import is_trusted_local_request, verify_auth_token
     from src.geo_control import (
         read_list,
         write_list_atomic,
@@ -89,7 +89,9 @@ def require_auth(
     if is_trusted_local_request(request):
         return True
 
-    if credentials is None or not (credentials.credentials or "").strip():
+    presented = (credentials.credentials or "") if credentials else ""
+
+    if not presented.strip():
         raise HTTPException(
             status_code=403,
             detail=(
@@ -97,6 +99,14 @@ def require_auth(
                 "requests. Only callers on this machine (loopback) may omit it."
             ),
         )
+
+    if not verify_auth_token(presented):
+        logger.warning(
+            "Rejected request from %s: bearer token does not match "
+            "WAF_AGENT_AUTH_TOKEN",
+            request.client.host if request.client else "unknown",
+        )
+        raise HTTPException(status_code=403, detail="Invalid bearer token.")
 
     return False
 
