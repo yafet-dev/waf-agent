@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover
 from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+import src.geo_routes as geo_routes  # noqa: E402
 import src.main as main  # noqa: E402
 from src.waf_toggle import toggle_waf_for_domain  # noqa: E402
 
@@ -139,14 +140,15 @@ def test_ban_endpoint_follows_the_same_rule():
 
 
 def test_geo_endpoints_follow_the_same_rule():
-    with patch.object(main, "set_mode_atomic"), patch.object(
-        main, "read_list", return_value={"ET"}
-    ):
+    url = "/v1/geo/example.com/mode"
+    with patch.object(geo_routes, "set_mode_atomic"), patch.object(
+        geo_routes, "ensure_domain_ready"
+    ), patch.object(geo_routes, "read_list", return_value={"ET"}):
         _PEER["host"] = "127.0.0.1"
-        assert client.post("/v1/geo/mode", json={"mode": "deny_only"}).status_code == 200
+        assert client.post(url, json={"mode": "deny_only"}).status_code == 200
 
         _PEER["host"] = "8.8.8.8"
-        assert client.post("/v1/geo/mode", json={"mode": "deny_only"}).status_code == 403
+        assert client.post(url, json={"mode": "deny_only"}).status_code == 403
 
 
 @pytest.mark.parametrize(
@@ -155,8 +157,8 @@ def test_geo_endpoints_follow_the_same_rule():
 def test_read_only_endpoints_stay_open(path):
     _PEER["host"] = "8.8.8.8"
     with patch.object(main, "get_ip_block_status", return_value={}), patch.object(
-        main, "get_current_mode", return_value="deny_only"
-    ), patch.object(main, "read_list", return_value=set()):
+        geo_routes, "get_all_status", return_value={"domains": [], "total_domains": 0}
+    ):
         assert client.get(path).status_code == 200
 
 

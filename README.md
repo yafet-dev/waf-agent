@@ -129,6 +129,25 @@ Authorization: Bearer <token>     # omit only when calling over loopback
 GET /waf/status/{domain}
 ```
 
+### Geo Access Control
+
+Country blocking, scoped per domain. The first request for a domain creates all
+the nginx files it needs and wires them into its server block.
+
+```bash
+POST   /v1/geo/{domain}/mode              {"mode": "allow_only" | "deny_only"}
+POST   /v1/geo/{domain}/allow             {"country": "ET"}
+DELETE /v1/geo/{domain}/allow/{country}
+POST   /v1/geo/{domain}/deny              {"country": "CN"}
+DELETE /v1/geo/{domain}/deny/{country}
+GET    /v1/geo/{domain}/status
+GET    /v1/geo/status                     all domains
+```
+
+Requires the nginx GeoIP2 module and a country database. See
+[docs/GEO_ACCESS_CONTROL.md](docs/GEO_ACCESS_CONTROL.md) for setup and the full
+file layout.
+
 ## Tests
 
 ```bash

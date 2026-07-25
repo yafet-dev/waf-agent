@@ -20,6 +20,21 @@ WAF_BLOCKS_DIR = Path("/etc/nginx/waf/blocks")
 WAF_MAPS_DIR = Path("/etc/nginx/waf/maps")
 WAF_SERVERS_DIR = Path("/etc/nginx/waf/servers")
 
+# Geo access control paths
+GEO_LISTS_DIR = Path(os.getenv("GEO_LISTS_DIR", "/etc/nginx/waf/geo-lists"))
+GEO_SERVERS_DIR = Path(os.getenv("GEO_SERVERS_DIR", "/etc/nginx/waf/geo-servers"))
+
+# Geo map files declare `map` blocks, which nginx only accepts in the http
+# context. Standard Debian/Ubuntu nginx.conf already carries
+# `include /etc/nginx/conf.d/*.conf;` inside http, so writing there wires the
+# maps in without ever editing nginx.conf.
+NGINX_CONF_D = Path(os.getenv("NGINX_CONF_D", "/etc/nginx/conf.d"))
+
+# The nginx variable holding the visitor's ISO-3166-1 alpha-2 country code.
+# Depends on how the GeoIP2 module is configured; override if your setup
+# exposes a different name (e.g. $geoip2_data_country_code).
+GEO_COUNTRY_VARIABLE = os.getenv("GEO_COUNTRY_VARIABLE", "$geoip2_country_code")
+
 # Find nginx and systemctl binaries
 def find_binary(name: str, common_paths: list[str] = None) -> str:
     """Find a binary in common system paths"""
