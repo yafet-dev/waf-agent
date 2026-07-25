@@ -9,16 +9,20 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Configuration paths
-NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
-NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
+# Configuration paths.
+#
+# Every location is env-overridable so the agent can run against a test tree
+# instead of the real /etc/nginx. The defaults are the standard Debian/Ubuntu
+# layout, so a normal deployment needs none of these set.
+NGINX_SITES_AVAILABLE = Path(os.getenv("NGINX_SITES_AVAILABLE", "/etc/nginx/sites-available"))
+NGINX_SITES_ENABLED = Path(os.getenv("NGINX_SITES_ENABLED", "/etc/nginx/sites-enabled"))
 PRIVATE_KEY_PATH = Path(os.getenv("WAF_AGENT_PRIVATE_KEY", "/etc/waf-agent/private_key.pem"))
 PUBLIC_KEY_PATH = Path(os.getenv("WAF_AGENT_PUBLIC_KEY", "/etc/waf-agent/public_key.pem"))
 
 # WAF IP blocking paths
-WAF_BLOCKS_DIR = Path("/etc/nginx/waf/blocks")
-WAF_MAPS_DIR = Path("/etc/nginx/waf/maps")
-WAF_SERVERS_DIR = Path("/etc/nginx/waf/servers")
+WAF_BLOCKS_DIR = Path(os.getenv("WAF_BLOCKS_DIR", "/etc/nginx/waf/blocks"))
+WAF_MAPS_DIR = Path(os.getenv("WAF_MAPS_DIR", "/etc/nginx/waf/maps"))
+WAF_SERVERS_DIR = Path(os.getenv("WAF_SERVERS_DIR", "/etc/nginx/waf/servers"))
 
 # Geo access control paths
 GEO_LISTS_DIR = Path(os.getenv("GEO_LISTS_DIR", "/etc/nginx/waf/geo-lists"))

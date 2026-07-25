@@ -16,6 +16,7 @@ from .nginx_utils import (
     get_modsecurity_status
 )
 from .security import verify_signature
+from .domains import normalize_domain
 
 logger = logging.getLogger(__name__)
 
@@ -104,9 +105,13 @@ def toggle_waf_for_domain(
     Raises:
         HTTPException: For various error conditions
     """
-    # Validate input
-    if not domain or not domain.strip():
-        raise HTTPException(status_code=400, detail="Domain is required")
+    # Validate input. normalize_domain rejects path separators and the like
+    # before the domain is used to resolve an nginx config file.
+    #
+    # Note this runs BEFORE signature verification, and the signature covers
+    # "domain|enabled" -- so the value that gets signed and the value that gets
+    # used must be the same one. Verification below uses the normalized form.
+    domain = normalize_domain(domain)
 
     has_signature = bool(signature and signature.strip())
 

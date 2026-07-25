@@ -14,6 +14,11 @@ from datetime import datetime
 from fastapi import HTTPException
 from .config import WAF_BLOCKS_DIR, WAF_MAPS_DIR, WAF_SERVERS_DIR, NGINX_SITES_AVAILABLE
 from .nginx_utils import test_nginx_config, reload_nginx, read_nginx_config, write_nginx_config, get_nginx_config_path
+from .domains import (
+    normalize_domain,
+    safe_domain_path,
+    sanitize_domain_for_variable as _sanitize_domain_for_variable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +28,8 @@ _reload_lock = threading.Lock()
 _RELOAD_DEBOUNCE_SECONDS = 2
 
 
-def sanitize_domain_for_variable(domain: str) -> str:
-    """Convert domain to valid nginx variable name (replace . and - with _)"""
-    return domain.replace('.', '_').replace('-', '_')
+# Re-exported for callers that already import it from this module.
+sanitize_domain_for_variable = _sanitize_domain_for_variable
 
 
 def ensure_directories() -> None:
@@ -35,19 +39,24 @@ def ensure_directories() -> None:
         logger.debug(f"Ensured directory exists: {directory}")
 
 
+# Path builders validate the domain and confirm the result stays inside its
+# base directory. The agent runs as root, and these names come straight from a
+# request body, so an unvalidated join here would let a caller write anywhere
+# on the filesystem.
+
 def get_block_file_path(domain: str) -> Path:
     """Get the path to the block map file for a domain"""
-    return WAF_BLOCKS_DIR / f"{domain}.map"
+    return safe_domain_path(WAF_BLOCKS_DIR, domain, ".map")
 
 
 def get_map_config_path(domain: str) -> Path:
     """Get the path to the map config file for a domain"""
-    return WAF_MAPS_DIR / f"{domain}.conf"
+    return safe_domain_path(WAF_MAPS_DIR, domain, ".conf")
 
 
 def get_server_rule_path(domain: str) -> Path:
     """Get the path to the server rule file for a domain"""
-    return WAF_SERVERS_DIR / f"{domain}.conf"
+    return safe_domain_path(WAF_SERVERS_DIR, domain, ".conf")
 
 
 def update_block_file(domain: str, ip: str, action: str) -> bool:
@@ -371,11 +380,24 @@ def ban_unban_ip(ip: str, domains: List[str], action: str) -> Dict:
     any_changed = False
     vhost_changes = []  # List of (domain, backup_path) tuples
     
-    for domain in domains:
-        domain = domain.strip()
-        if not domain:
+    for raw_domain in domains:
+        if not raw_domain or not raw_domain.strip():
             continue
-        
+
+        # Validate before the domain reaches any path builder. Reported per
+        # domain rather than raised, so one bad entry does not abort a batch
+        # that is otherwise valid.
+        try:
+            domain = normalize_domain(raw_domain)
+        except HTTPException as e:
+            logger.warning(f"Rejected invalid domain {raw_domain!r}: {e.detail}")
+            results.append({
+                "domain": raw_domain,
+                "changed": False,
+                "message": f"Invalid domain: {e.detail}",
+            })
+            continue
+
         try:
             # Update block file
             block_changed = update_block_file(domain, ip, action)

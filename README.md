@@ -53,6 +53,54 @@ sudo bash scripts/install.sh
 - Root/sudo access (for nginx operations)
 - RSA key pair for encryption
 
+## Domain input
+
+Every feature turns a caller-supplied domain into a filesystem path, and the
+agent runs as root. All of them go through one validator
+([src/domains.py](src/domains.py)), which accepts **only a domain or
+subdomain**:
+
+| Accepted | Rejected |
+| --- | --- |
+| `example.com` | `../../../etc/passwd` |
+| `waf.example.com` | `/etc/shadow` |
+| `deep.sub.example.co.uk` | `example.com/../evil` |
+| `my-site.com` | `example.com; rm -rf /` |
+| `xn--80ak6aa92e.com` (IDN) | `*`, `*.example.com` |
+| | `localhost` (single label) |
+| | anything with `/`, `\`, null bytes, or newlines |
+
+Input is rejected, not sanitized — a domain containing `..` is a bug or an
+attack, not something to quietly rewrite into a different domain. Whitespace,
+letter case, and a trailing root dot are the only things normalized away.
+
+A second, redundant check confirms each finished path really sits inside its
+base directory, so a future weakening of the pattern still cannot write
+outside `/etc/nginx/waf/`.
+
+The backend applies identical rules before signing
+(`modsec-backend/src/utils/normalizeDomain.ts`) so the signed string and the
+verified string always match.
+
+## Configuration
+
+Every path is env-overridable; defaults are the standard Debian/Ubuntu layout,
+so a normal deployment needs none of these.
+
+| Variable | Default |
+| --- | --- |
+| `WAF_AGENT_AUTH_TOKEN` | *(unset — see Authentication)* |
+| `WAF_AGENT_STRICT_AUTH` | `false` |
+| `WAF_AGENT_PRIVATE_KEY` | `/etc/waf-agent/private_key.pem` |
+| `GEO_COUNTRY_VARIABLE` | `$geoip2_country_code` |
+| `GEO_LISTS_DIR` | `/etc/nginx/waf/geo-lists` |
+| `GEO_SERVERS_DIR` | `/etc/nginx/waf/geo-servers` |
+| `NGINX_CONF_D` | `/etc/nginx/conf.d` |
+| `NGINX_SITES_AVAILABLE` | `/etc/nginx/sites-available` |
+| `WAF_BLOCKS_DIR` | `/etc/nginx/waf/blocks` |
+| `WAF_MAPS_DIR` | `/etc/nginx/waf/maps` |
+| `WAF_SERVERS_DIR` | `/etc/nginx/waf/servers` |
+
 ## Authentication
 
 Mutating endpoints require a bearer token and, for `/waf/toggle`, an RSA

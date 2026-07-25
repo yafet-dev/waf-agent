@@ -48,6 +48,7 @@ try:
         GEO_COUNTRY_VARIABLE,
     )
     from .nginx_utils import get_nginx_config_path, read_nginx_config, write_nginx_config
+    from .domains import normalize_domain, sanitize_domain_for_variable, safe_domain_path
 except ImportError:
     from src.config import (
         NGINX_BINARY,
@@ -58,6 +59,7 @@ except ImportError:
         GEO_COUNTRY_VARIABLE,
     )
     from src.nginx_utils import get_nginx_config_path, read_nginx_config, write_nginx_config
+    from src.domains import normalize_domain, sanitize_domain_for_variable, safe_domain_path
 
 logger = logging.getLogger(__name__)
 
@@ -65,75 +67,39 @@ logger = logging.getLogger(__name__)
 COUNTRY_RE = re.compile(r'^[A-Z]{2}$')
 CMD_TIMEOUT = 10  # seconds
 
-# A hostname label: letters, digits, hyphens; labels joined by dots. Rejects
-# path separators, "..", spaces and other things that could escape the geo
-# directories when interpolated into a filename.
-DOMAIN_RE = re.compile(
-    r'^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
-    r'(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
-)
-
 VALID_MODES = ("allow_only", "deny_only")
 
 
-# ─── Domain handling ────────────────────────────────────────────────────────
-
-def normalize_domain(domain: str) -> str:
-    """
-    Validate and canonicalize a domain before it is used in a file path.
-
-    Raises HTTPException(400) for anything that is not a plain hostname. This
-    is the only guard between a request body and the filesystem, so it rejects
-    rather than sanitizes: a domain containing "/" or ".." is a bug or an
-    attack, not something to quietly rewrite.
-    """
-    if not domain or not domain.strip():
-        raise HTTPException(status_code=400, detail="Domain is required")
-
-    candidate = domain.strip().lower().rstrip('.')
-
-    if not DOMAIN_RE.match(candidate):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Invalid domain '{domain}'. Expected a hostname such as "
-                "'example.com'."
-            ),
-        )
-
-    return candidate
-
-
-def sanitize_domain_for_variable(domain: str) -> str:
-    """Convert a domain into a valid nginx variable name fragment."""
-    return domain.replace('.', '_').replace('-', '_')
-
-
 # ─── Per-domain paths ───────────────────────────────────────────────────────
+#
+# Every builder goes through safe_domain_path(), which validates the domain and
+# confirms the finished path sits inside its base directory. Validating here
+# rather than only in the request handlers means these are safe no matter which
+# module calls them.
 
 def get_allow_list_path(domain: str) -> Path:
-    return GEO_LISTS_DIR / f"{domain}.allow"
+    return safe_domain_path(GEO_LISTS_DIR, domain, ".allow")
 
 
 def get_deny_list_path(domain: str) -> Path:
-    return GEO_LISTS_DIR / f"{domain}.deny"
+    return safe_domain_path(GEO_LISTS_DIR, domain, ".deny")
 
 
 def get_map_config_path(domain: str) -> Path:
     """http-context map block; lives in conf.d so nginx.conf needs no edit."""
-    return NGINX_CONF_D / f"waf-geo-{domain}.conf"
+    return safe_domain_path(NGINX_CONF_D, domain, ".conf", prefix="waf-geo-")
 
 
 def get_allow_only_conf_path(domain: str) -> Path:
-    return GEO_SERVERS_DIR / f"{domain}.allow_only.conf"
+    return safe_domain_path(GEO_SERVERS_DIR, domain, ".allow_only.conf")
 
 
 def get_deny_only_conf_path(domain: str) -> Path:
-    return GEO_SERVERS_DIR / f"{domain}.deny_only.conf"
+    return safe_domain_path(GEO_SERVERS_DIR, domain, ".deny_only.conf")
 
 
 def get_active_conf_path(domain: str) -> Path:
-    return GEO_SERVERS_DIR / f"{domain}.active.conf"
+    return safe_domain_path(GEO_SERVERS_DIR, domain, ".active.conf")
 
 
 def ensure_directories() -> None:
