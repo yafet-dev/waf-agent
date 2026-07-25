@@ -47,7 +47,7 @@ try:
         NGINX_CONF_D,
         GEO_COUNTRY_VARIABLE,
     )
-    from .nginx_utils import get_nginx_config_path, read_nginx_config, write_nginx_config
+    from .nginx_utils import insert_include_into_server_blocks, find_server_blocks_for_domain
     from .domains import normalize_domain, sanitize_domain_for_variable, safe_domain_path
 except ImportError:
     from src.config import (
@@ -58,7 +58,7 @@ except ImportError:
         NGINX_CONF_D,
         GEO_COUNTRY_VARIABLE,
     )
-    from src.nginx_utils import get_nginx_config_path, read_nginx_config, write_nginx_config
+    from src.nginx_utils import insert_include_into_server_blocks, find_server_blocks_for_domain
     from src.domains import normalize_domain, sanitize_domain_for_variable, safe_domain_path
 
 logger = logging.getLogger(__name__)
@@ -213,101 +213,66 @@ map {GEO_COUNTRY_VARIABLE} $geo_deny_{safe} {{
     return changed
 
 
-def ensure_vhost_includes_geo(domain: str) -> Tuple[bool, Optional[Path]]:
+def ensure_vhost_includes_geo(domain: str) -> List[Tuple[Path, Optional[Path]]]:
     """
-    Add the geo include to the domain's server block, once.
+    Add the geo include to every server block that serves the domain.
 
-    Returns (was_modified, backup_path). A missing vhost is not fatal: the geo
-    files are still written, so enforcement starts as soon as the vhost exists.
+    Returns (changed_paths, backup_paths).
+
+    Raises HTTPException(409) when no server block declares the domain. That is
+    deliberately a hard failure. This previously logged a warning and reported
+    success, so a vhost stored under a name the agent did not guess -- for
+    example gnzabe-apis.conf holding `server_name gnzabe.com;` -- produced a
+    fully "successful" request: lists written, nginx reloaded, HTTP 200,
+    database updated, and no enforcement at all. A security control that
+    quietly does nothing is worse than one that refuses.
     """
-    # A missing or unreadable vhost is not fatal. The geo files are still
-    # written, so enforcement begins as soon as the site exists -- failing the
-    # whole request would mean a country list could not be edited just because
-    # the site is not deployed yet.
-    try:
-        config_path = get_nginx_config_path(domain)
-        config_content = read_nginx_config(config_path)
-    except (FileNotFoundError, OSError) as e:
-        logger.warning(
-            f"Could not read a vhost for {domain} ({e}); geo files were written "
-            "but nothing enforces them until the site exists."
-        )
-        return False, None
     include_line = f"include {get_active_conf_path(domain)};"
 
-    if include_line in config_content:
-        logger.debug(f"Geo include already present in {config_path}")
-        return False, None
-
-    lines = config_content.split('\n')
-    inserted = False
-
-    # Preferred anchor: immediately after server_name.
-    for i, line in enumerate(lines):
-        if re.search(r'server_name\s+', line) and ';' in line:
-            indent = len(line) - len(line.lstrip())
-            lines.insert(i + 1, ' ' * indent + include_line)
-            inserted = True
-            logger.info(f"Inserted geo include after server_name in {config_path}")
-            break
-
-    # Fallback: just inside the server block.
-    if not inserted:
-        for i, line in enumerate(lines):
-            if line.strip().startswith('server {'):
-                indent = len(line) - len(line.lstrip()) + 4
-                for j in range(i + 1, min(i + 5, len(lines))):
-                    if lines[j].strip():
-                        indent = len(lines[j]) - len(lines[j].lstrip())
-                        break
-                lines.insert(i + 1, ' ' * indent + include_line)
-                inserted = True
-                logger.info(f"Inserted geo include into server block in {config_path}")
-                break
-
-    if not inserted:
-        logger.error(f"Could not find a server block in {config_path}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not find a server block in {config_path} to add the geo rule to.",
-        )
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = config_path.with_suffix(f"{config_path.suffix}.bak-{timestamp}")
     try:
-        shutil.copy2(config_path, backup_path)
-        logger.info(f"Created backup: {backup_path}")
-    except Exception as e:
-        logger.warning(f"Failed to create backup of {config_path}: {e}")
-        backup_path = None
-
-    write_nginx_config(config_path, '\n'.join(lines))
-    return True, backup_path
+        return insert_include_into_server_blocks(domain, include_line)
+    except FileNotFoundError as e:
+        logger.error(f"Cannot enforce geo rules for {domain}: {e}")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"No nginx server block serves '{domain}', so geo rules cannot be "
+                f"enforced and were not applied. Add a server block containing "
+                f"'server_name {domain};' and try again. ({e})"
+            ),
+        )
 
 
 def ensure_domain_ready(domain: str) -> None:
     """
-    Full provisioning for a domain: files plus the vhost include.
+    Full provisioning for a domain: rule files plus the vhost include.
 
-    Rolls the vhost back if the resulting config does not pass nginx -t, so a
+    Rolls every touched vhost back if the resulting config fails nginx -t, so a
     failed provision cannot leave nginx unable to start.
     """
     ensure_domain_files(domain)
-    vhost_changed, backup_path = ensure_vhost_includes_geo(domain)
+    changes = ensure_vhost_includes_geo(domain)
 
-    if not vhost_changed:
+    if not changes:
         return
 
     try:
         validate_and_reload_nginx()
     except Exception:
-        if backup_path and backup_path.exists():
+        for changed_path, backup_path in changes:
+            if not backup_path:
+                logger.error(
+                    f"No backup available for {changed_path}; the geo include "
+                    "must be removed manually."
+                )
+                continue
             try:
-                shutil.copy2(backup_path, get_nginx_config_path(domain))
-                logger.info(f"Rolled back vhost changes for {domain}")
+                shutil.copy2(backup_path, changed_path)
+                logger.info(f"Rolled back vhost changes in {changed_path}")
             except Exception as rollback_err:
-                logger.error(f"Failed to roll back vhost for {domain}: {rollback_err}")
+                logger.error(f"Failed to roll back {changed_path}: {rollback_err}")
         raise
+
 
 
 # ─── List read/write ────────────────────────────────────────────────────────
@@ -447,13 +412,47 @@ def get_configured_domains() -> List[str]:
 
 
 def get_domain_status(domain: str) -> Dict:
-    """Mode plus allow/deny lists for one domain."""
+    """
+    Mode plus allow/deny lists for one domain, and whether nginx is actually
+    enforcing them.
+
+    `enforced` reports whether a server block serving this domain includes the
+    active rule. Rules can exist on disk while no vhost references them, which
+    is precisely the state that used to be reported as success -- so the status
+    says so explicitly rather than leaving the lists to imply protection.
+    """
+    enforced_in = enforcement_locations(domain)
+
     return {
         "domain": domain,
         "mode": get_current_mode(domain),
         "allow": sorted(read_list(get_allow_list_path(domain))),
         "deny": sorted(read_list(get_deny_list_path(domain))),
+        "enforced": bool(enforced_in),
+        "enforced_in": enforced_in,
     }
+
+
+def enforcement_locations(domain: str) -> List[str]:
+    """Config files whose server block for this domain includes the geo rule."""
+    include_line = f"include {get_active_conf_path(domain)};"
+    found = []
+
+    try:
+        blocks = find_server_blocks_for_domain(domain)
+    except Exception as e:
+        logger.warning(f"Could not inspect vhosts for {domain}: {e}")
+        return []
+
+    for block in blocks:
+        try:
+            content = block.path.read_text()
+        except OSError:
+            continue
+        if include_line in content[block.body_start : block.body_end]:
+            found.append(str(block.path))
+
+    return sorted(set(found))
 
 
 def get_all_status() -> Dict:

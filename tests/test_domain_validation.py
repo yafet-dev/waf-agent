@@ -209,7 +209,7 @@ def test_ban_reports_an_invalid_domain_without_aborting_the_batch(monkeypatch):
     )
     monkeypatch.setattr(ipb, "ensure_map_config", lambda d: None)
     monkeypatch.setattr(ipb, "ensure_server_rule", lambda d: None)
-    monkeypatch.setattr(ipb, "ensure_vhost_includes_rule", lambda d: (False, None))
+    monkeypatch.setattr(ipb, "ensure_vhost_includes_rule", lambda d: [])
     monkeypatch.setattr(ipb, "_debounced_reload_nginx", lambda: None)
 
     result = ipb.ban_unban_ip(

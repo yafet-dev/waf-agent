@@ -214,6 +214,10 @@ def test_unconfigured_domain_reports_unknown_without_creating_anything(geo_dirs)
         "mode": "unknown",
         "allow": [],
         "deny": [],
+        # Rules can exist on disk with no vhost referencing them, so status
+        # states enforcement explicitly rather than letting the lists imply it.
+        "enforced": False,
+        "enforced_in": [],
     }
     assert not geo.get_allow_list_path("never-seen.com").exists()
 
@@ -266,88 +270,241 @@ def test_a_failed_nginx_reload_restores_the_previous_mode(geo_dirs, monkeypatch)
 
 
 # ─── vhost wiring ───────────────────────────────────────────────────────────
+#
+# The enforcement include has to land in the server block that actually serves
+# the domain. Resolving that block by FILENAME was the production defect: a
+# vhost stored as gnzabe-apis.conf holding `server_name gnzabe.com;` was never
+# found, so lists were written, nginx reloaded, HTTP 200 returned, and nothing
+# was enforced.
 
-def test_geo_include_is_added_to_the_vhost_after_server_name(geo_dirs, tmp_path):
-    domain = "gnzabe.com"
-    vhost = tmp_path / f"{domain}.conf"
-    vhost.write_text(
+
+@pytest.fixture
+def nginx_tree(tmp_path, monkeypatch):
+    """A sites-available/sites-enabled layout the resolver will scan."""
+    available = tmp_path / "sites-available"
+    enabled = tmp_path / "sites-enabled"
+    conf_d = tmp_path / "conf.d"
+    for directory in (available, enabled, conf_d):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    import src.nginx_utils as nginx_utils
+
+    monkeypatch.setattr(nginx_utils, "NGINX_SITES_AVAILABLE", available)
+    monkeypatch.setattr(nginx_utils, "NGINX_SITES_ENABLED", enabled)
+    monkeypatch.setattr(nginx_utils, "NGINX_CONF_D", conf_d)
+
+    return types.SimpleNamespace(available=available, enabled=enabled, conf_d=conf_d)
+
+
+def write_vhost(directory, filename, body):
+    path = directory / filename
+    path.write_text(body)
+    return path
+
+
+def test_vhost_is_found_by_server_name_not_filename(geo_dirs, nginx_tree):
+    """The production defect: filename and domain do not match."""
+    vhost = write_vhost(
+        nginx_tree.available,
+        "gnzabe-apis.conf",
         "server {\n"
         "    listen 80;\n"
-        f"    server_name {domain};\n"
+        "    server_name gnzabe.com www.gnzabe.com;\n"
         "    location / { proxy_pass http://127.0.0.1:3000; }\n"
+        "}\n",
+    )
+
+    geo.ensure_domain_files("gnzabe.com")
+    changes = geo.ensure_vhost_includes_geo("gnzabe.com")
+
+    assert len(changes) == 1
+    assert changes[0][0] == vhost.resolve()
+    assert str(geo.get_active_conf_path("gnzabe.com")) in vhost.read_text()
+
+
+def test_include_lands_inside_the_matching_server_block(geo_dirs, nginx_tree):
+    vhost = write_vhost(
+        nginx_tree.available,
+        "sites.conf",
+        "server {\n"
+        "    server_name other.com;\n"
         "}\n"
+        "server {\n"
+        "    server_name gnzabe.com;\n"
+        "}\n",
     )
 
-    geo.ensure_domain_files(domain)
-    with patch.object(geo, "get_nginx_config_path", return_value=vhost):
-        changed, _ = geo.ensure_vhost_includes_geo(domain)
+    geo.ensure_domain_files("gnzabe.com")
+    geo.ensure_vhost_includes_geo("gnzabe.com")
 
-    assert changed is True
-    lines = vhost.read_text().split("\n")
-    server_name_idx = next(i for i, l in enumerate(lines) if "server_name" in l)
-    assert str(geo.get_active_conf_path(domain)) in lines[server_name_idx + 1]
+    text = vhost.read_text()
+    other_block, gnzabe_block = text.split("server {")[1], text.split("server {")[2]
+
+    assert "active.conf" not in other_block, "must not touch an unrelated block"
+    assert "active.conf" in gnzabe_block
 
 
-def test_geo_include_is_not_added_twice(geo_dirs, tmp_path):
-    domain = "gnzabe.com"
-    vhost = tmp_path / f"{domain}.conf"
-    vhost.write_text(
-        f"server {{\n    server_name {domain};\n}}\n"
+def test_every_matching_block_gets_the_include(geo_dirs, nginx_tree):
+    """A domain usually has an :80 redirect plus the :443 server."""
+    vhost = write_vhost(
+        nginx_tree.available,
+        "gnzabe-apis.conf",
+        "server {\n"
+        "    listen 80;\n"
+        "    server_name gnzabe.com;\n"
+        "    return 301 https://$host$request_uri;\n"
+        "}\n"
+        "server {\n"
+        "    listen 443 ssl;\n"
+        "    server_name gnzabe.com;\n"
+        "    location / { proxy_pass http://127.0.0.1:3000; }\n"
+        "}\n",
     )
 
-    geo.ensure_domain_files(domain)
-    with patch.object(geo, "get_nginx_config_path", return_value=vhost):
-        assert geo.ensure_vhost_includes_geo(domain)[0] is True
-        assert geo.ensure_vhost_includes_geo(domain)[0] is False
+    geo.ensure_domain_files("gnzabe.com")
+    geo.ensure_vhost_includes_geo("gnzabe.com")
+
+    assert vhost.read_text().count("active.conf") == 2
+
+
+def test_a_location_block_does_not_end_the_server_block_early(geo_dirs, nginx_tree):
+    """Brace tracking: server_name after a location block must still match."""
+    vhost = write_vhost(
+        nginx_tree.available,
+        "tricky.conf",
+        "server {\n"
+        "    listen 80;\n"
+        "    location /api {\n"
+        "        proxy_pass http://127.0.0.1:3000;\n"
+        "    }\n"
+        "    server_name gnzabe.com;\n"
+        "}\n",
+    )
+
+    geo.ensure_domain_files("gnzabe.com")
+    changes = geo.ensure_vhost_includes_geo("gnzabe.com")
+
+    assert len(changes) == 1
+    assert "active.conf" in vhost.read_text()
+
+
+def test_a_commented_out_server_name_is_ignored(geo_dirs, nginx_tree):
+    write_vhost(
+        nginx_tree.available,
+        "commented.conf",
+        "server {\n"
+        "    # server_name gnzabe.com;\n"
+        "    server_name other.com;\n"
+        "}\n",
+    )
+
+    geo.ensure_domain_files("gnzabe.com")
+
+    with pytest.raises(HTTPException) as excinfo:
+        geo.ensure_vhost_includes_geo("gnzabe.com")
+    assert excinfo.value.status_code == 409
+
+
+def test_symlinked_sites_enabled_edits_the_real_file(geo_dirs, nginx_tree):
+    real = write_vhost(
+        nginx_tree.available,
+        "gnzabe-apis.conf",
+        "server {\n    server_name gnzabe.com;\n}\n",
+    )
+    link = nginx_tree.enabled / "gnzabe-apis.conf"
+    try:
+        link.symlink_to(real)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable on this platform/account")
+
+    geo.ensure_domain_files("gnzabe.com")
+    changes = geo.ensure_vhost_includes_geo("gnzabe.com")
+
+    # Edited once, through the real file rather than twice via the symlink.
+    assert len(changes) == 1
+    assert real.read_text().count("active.conf") == 1
+
+
+def test_wildcard_server_name_matches(geo_dirs, nginx_tree):
+    write_vhost(
+        nginx_tree.available,
+        "wild.conf",
+        "server {\n    server_name *.gnzabe.com;\n}\n",
+    )
+
+    geo.ensure_domain_files("api.gnzabe.com")
+    assert len(geo.ensure_vhost_includes_geo("api.gnzabe.com")) == 1
+
+
+def test_catch_all_server_name_is_not_treated_as_a_match(geo_dirs, nginx_tree):
+    """`server_name _;` is the default server, not a claim to serve a domain."""
+    write_vhost(
+        nginx_tree.available,
+        "default.conf",
+        "server {\n    server_name _;\n}\n",
+    )
+
+    geo.ensure_domain_files("gnzabe.com")
+
+    with pytest.raises(HTTPException) as excinfo:
+        geo.ensure_vhost_includes_geo("gnzabe.com")
+    assert excinfo.value.status_code == 409
+
+
+def test_include_is_not_added_twice(geo_dirs, nginx_tree):
+    vhost = write_vhost(
+        nginx_tree.available,
+        "gnzabe-apis.conf",
+        "server {\n    server_name gnzabe.com;\n}\n",
+    )
+
+    geo.ensure_domain_files("gnzabe.com")
+    assert len(geo.ensure_vhost_includes_geo("gnzabe.com")) == 1
+    assert geo.ensure_vhost_includes_geo("gnzabe.com") == []
 
     assert vhost.read_text().count("active.conf") == 1
 
 
-def test_a_missing_vhost_is_not_fatal(geo_dirs):
-    """Geo files still get written; enforcement starts when the site exists."""
-    domain = "not-deployed-yet.com"
-    geo.ensure_domain_files(domain)
-
-    def missing(_):
-        raise FileNotFoundError("no vhost")
-
-    with patch.object(geo, "get_nginx_config_path", side_effect=missing):
-        changed, backup = geo.ensure_vhost_includes_geo(domain)
-
-    assert changed is False and backup is None
-    assert geo.get_allow_list_path(domain).exists()
-
-
-def test_an_unreadable_vhost_path_is_not_fatal(geo_dirs, tmp_path):
+def test_no_matching_server_block_is_a_hard_failure(geo_dirs, nginx_tree):
     """
-    A path that resolves but cannot be read must not 500 the request -- a
-    country list should stay editable even when the site is half-deployed.
+    The heart of the bug report. Writing rule files while silently skipping the
+    include reported success for a control that was never active, so this must
+    raise rather than warn.
     """
-    domain = "half-deployed.com"
-    geo.ensure_domain_files(domain)
-    ghost = tmp_path / "sites-available" / domain  # never created
+    write_vhost(
+        nginx_tree.available,
+        "somethingelse.conf",
+        "server {\n    server_name unrelated.com;\n}\n",
+    )
 
-    with patch.object(geo, "get_nginx_config_path", return_value=ghost):
-        changed, backup = geo.ensure_vhost_includes_geo(domain)
+    geo.ensure_domain_files("gnzabe.com")
 
-    assert changed is False and backup is None
+    with pytest.raises(HTTPException) as excinfo:
+        geo.ensure_vhost_includes_geo("gnzabe.com")
+
+    assert excinfo.value.status_code == 409
+    assert "gnzabe.com" in excinfo.value.detail
 
 
-def test_list_edits_survive_a_missing_vhost(geo_dirs):
-    """The end-to-end shape of the bug: syncing a not-yet-deployed domain."""
-    domain = "not-deployed-yet.com"
+def test_ensure_domain_ready_propagates_the_failure(geo_dirs, nginx_tree):
+    """A geo request for an unserved domain must not report success."""
+    with pytest.raises(HTTPException) as excinfo:
+        geo.ensure_domain_ready("never-served.com")
+    assert excinfo.value.status_code == 409
 
-    def missing(_):
-        raise FileNotFoundError("no vhost")
 
-    with patch.object(geo, "get_nginx_config_path", side_effect=missing):
-        geo.ensure_domain_ready(domain)
-        geo.write_list_atomic(geo.get_deny_list_path(domain), {"US"})
-        geo.set_mode_atomic(domain, "deny_only")
+def test_a_failed_nginx_test_rolls_the_vhost_back(geo_dirs, nginx_tree, monkeypatch):
+    original = (
+        "server {\n    server_name gnzabe.com;\n}\n"
+    )
+    vhost = write_vhost(nginx_tree.available, "gnzabe-apis.conf", original)
 
-    assert geo.get_domain_status(domain) == {
-        "domain": domain,
-        "mode": "deny_only",
-        "allow": [],
-        "deny": ["US"],
-    }
+    def boom():
+        raise HTTPException(status_code=500, detail="nginx -t failed")
+
+    monkeypatch.setattr(geo, "validate_and_reload_nginx", boom)
+
+    with pytest.raises(HTTPException):
+        geo.ensure_domain_ready("gnzabe.com")
+
+    assert vhost.read_text() == original, "vhost should be restored"

@@ -13,7 +13,14 @@ from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 from fastapi import HTTPException
 from .config import WAF_BLOCKS_DIR, WAF_MAPS_DIR, WAF_SERVERS_DIR, NGINX_SITES_AVAILABLE
-from .nginx_utils import test_nginx_config, reload_nginx, read_nginx_config, write_nginx_config, get_nginx_config_path
+from .nginx_utils import (
+    test_nginx_config,
+    reload_nginx,
+    read_nginx_config,
+    write_nginx_config,
+    get_nginx_config_path,
+    insert_include_into_server_blocks,
+)
 from .domains import (
     normalize_domain,
     safe_domain_path,
@@ -217,85 +224,22 @@ def ensure_server_rule(domain: str) -> None:
             raise
 
 
-def ensure_vhost_includes_rule(domain: str) -> Tuple[bool, Optional[Path]]:
+def ensure_vhost_includes_rule(domain: str) -> List[Tuple[Path, Optional[Path]]]:
     """
-    Ensure vhost file includes the server rule (only once)
-    Returns:
-        Tuple[bool, Optional[Path]]: (was_modified, backup_path)
+    Ensure every server block serving the domain includes the block rule.
+
+    Returns (changed_paths, backup_paths).
+
+    Raises FileNotFoundError when no server block declares the domain. Skipping
+    the include used to be a warning, which meant an IP could be recorded in
+    the block map and reported as banned while nginx never evaluated the rule.
+    Blocks are matched by server_name, so a vhost stored under an unrelated
+    filename is found correctly.
     """
-    try:
-        config_path = get_nginx_config_path(domain)
-    except FileNotFoundError:
-        logger.warning(f"Vhost file not found for domain {domain}, skipping include")
-        return False, None
-    
-    # Create backup
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = config_path.with_suffix(f"{config_path.suffix}.bak-{timestamp}")
-    
-    try:
-        config_content = read_nginx_config(config_path)
-    except Exception as e:
-        logger.error(f"Error reading vhost config {config_path}: {e}")
-        raise
-    
     server_rule_path = get_server_rule_path(domain)
     include_line = f"include {server_rule_path};"
-    
-    # Check if include already exists
-    if include_line in config_content:
-        logger.debug(f"Server rule already included in {config_path}")
-        return False, None
-    
-    # Find server_name line and insert include after it
-    lines = config_content.split('\n')
-    modified = False
-    server_rule_inserted = False
-    
-    for i, line in enumerate(lines):
-        # Look for server_name directive
-        if re.search(r'server_name\s+', line) and not server_rule_inserted:
-            # Find the end of this line (after semicolon)
-            if ';' in line:
-                # Insert include on next line with same indentation
-                indent = len(line) - len(line.lstrip())
-                lines.insert(i + 1, ' ' * indent + include_line)
-                modified = True
-                server_rule_inserted = True
-                logger.info(f"Inserted server rule include in {config_path}")
-                break
-    
-    if not server_rule_inserted:
-        # Fallback: add at the beginning of server block
-        for i, line in enumerate(lines):
-            if line.strip().startswith('server {'):
-                indent = len(line) - len(line.lstrip())
-                # Find next non-empty line to match indentation
-                for j in range(i + 1, min(i + 5, len(lines))):
-                    if lines[j].strip():
-                        indent = len(lines[j]) - len(lines[j].lstrip())
-                        break
-                lines.insert(i + 1, ' ' * indent + include_line)
-                modified = True
-                server_rule_inserted = True
-                logger.info(f"Inserted server rule include in {config_path} (fallback)")
-                break
-    
-    if modified:
-        # Create backup before writing
-        try:
-            shutil.copy2(config_path, backup_path)
-            logger.info(f"Created backup: {backup_path}")
-        except Exception as e:
-            logger.warning(f"Failed to create backup: {e}")
-            backup_path = None
-        
-        # Write updated content
-        updated_content = '\n'.join(lines)
-        write_nginx_config(config_path, updated_content)
-        return True, backup_path
-    
-    return False, None
+
+    return insert_include_into_server_blocks(domain, include_line)
 
 
 def _debounced_reload_nginx() -> None:
@@ -408,17 +352,20 @@ def ban_unban_ip(ip: str, domains: List[str], action: str) -> Dict:
             # Ensure server rule exists
             ensure_server_rule(domain)
             
-            # Ensure vhost includes rule
-            vhost_changed_domain, backup_path = ensure_vhost_includes_rule(domain)
-            if vhost_changed_domain:
-                vhost_changes.append((domain, backup_path))
-            
-            if block_changed or vhost_changed_domain:
+            # Ensure every server block serving the domain includes the rule.
+            # Raises FileNotFoundError when none does, which is reported below
+            # rather than being swallowed -- an IP recorded in the block map
+            # but never referenced by nginx is not actually banned.
+            vhost_edits = ensure_vhost_includes_rule(domain)
+            vhost_changes.extend(vhost_edits)
+
+            if block_changed or vhost_edits:
                 any_changed = True
                 results.append({
                     "domain": domain,
                     "changed": True,
-                    "message": f"{action}ed" if action == "ban" else f"{action}ned"
+                    "message": f"{action}ed" if action == "ban" else f"{action}ned",
+                    "enforced_in": [str(p) for p, _ in vhost_edits] or "already present",
                 })
             else:
                 results.append({
@@ -426,13 +373,18 @@ def ban_unban_ip(ip: str, domains: List[str], action: str) -> Dict:
                     "changed": False,
                     "message": f"IP already {action}ed" if action == "ban" else f"IP not in block list"
                 })
-        
+
         except FileNotFoundError as e:
-            logger.error(f"Domain {domain} not found: {e}")
+            logger.error(f"Cannot enforce IP rules for {domain}: {e}")
             results.append({
                 "domain": domain,
                 "changed": False,
-                "message": f"Domain config not found: {str(e)}"
+                "enforced": False,
+                "message": (
+                    f"No nginx server block serves '{domain}', so the rule was "
+                    f"not enforced. Add a server block containing "
+                    f"'server_name {domain};'. ({e})"
+                ),
             })
         except Exception as e:
             logger.error(f"Error processing domain {domain}: {e}", exc_info=True)
@@ -449,14 +401,13 @@ def ban_unban_ip(ip: str, domains: List[str], action: str) -> Dict:
         if not test_ok:
             # Rollback vhost changes
             logger.error(f"Nginx config test failed: {test_message}, rolling back vhost changes...")
-            for domain, backup_path in vhost_changes:
-                if backup_path and backup_path.exists():
+            for changed_path, backup_path in vhost_changes:
+                if backup_path and Path(backup_path).exists():
                     try:
-                        config_path = get_nginx_config_path(domain)
-                        shutil.copy2(backup_path, config_path)
-                        logger.info(f"Rolled back vhost changes for {domain}")
+                        shutil.copy2(backup_path, changed_path)
+                        logger.info(f"Rolled back vhost changes in {changed_path}")
                     except Exception as e:
-                        logger.error(f"Failed to rollback vhost for {domain}: {e}")
+                        logger.error(f"Failed to rollback {changed_path}: {e}")
             
             return {
                 "ok": False,

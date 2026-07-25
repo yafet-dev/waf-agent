@@ -19,11 +19,41 @@ Created per domain (`example.com` shown):
 | `/etc/nginx/waf/geo-servers/example.com.deny_only.conf` | `if ($geo_deny_example_com) { return 403; }` |
 | `/etc/nginx/waf/geo-servers/example.com.active.conf` | Includes whichever mode is active |
 
-And one line is added inside the domain's `server` block:
+And one line is added inside **every** `server` block that serves the domain:
 
 ```nginx
 include /etc/nginx/waf/geo-servers/example.com.active.conf;
 ```
+
+### How the server block is found
+
+By its `server_name` directive, not its filename. A vhost is routinely stored
+under an unrelated name — `gnzabe-apis.conf` containing
+`server_name gnzabe.com www.gnzabe.com;` is a real example — and a
+filename-based lookup finds nothing there.
+
+The agent scans `sites-enabled`, `sites-available` and `conf.d`, resolves
+symlinks so edits land on the real file, parses each `server { … }` block with
+brace tracking (so a `location` block does not end the scan early), ignores
+commented-out directives, and matches exact names, `.example.com` and
+`*.example.com` forms. The catch-all `server_name _;` is **not** treated as a
+match — it is the default server, not a claim to serve your domain.
+
+A domain usually appears in two blocks (the `:80` redirect and the `:443`
+server); both receive the include, so a request is filtered before the
+redirect.
+
+### If no server block serves the domain
+
+The request **fails** with HTTP 409 and nothing is applied.
+
+This is deliberate. It previously logged a warning and returned success: the
+lists were written, nginx reloaded, HTTP 200 came back and the database was
+updated, while nginx never evaluated the rule. An administrator saw "Ethiopia
+blocked" in the UI and traffic from Ethiopia continued to arrive. A security
+control that quietly does nothing is worse than one that refuses.
+
+To fix a 409, ensure some server block declares `server_name yourdomain.com;`.
 
 The map blocks live in `conf.d` because nginx only accepts `map` in the `http`
 context, and the stock nginx.conf already carries
@@ -116,8 +146,19 @@ curl -X POST localhost:8080/v1/geo/gnzabe.com/mode \
      -H 'Content-Type: application/json' -d '{"mode":"deny_only"}'
 
 curl localhost:8080/v1/geo/gnzabe.com/status
-# {"domain":"gnzabe.com","mode":"deny_only","allow":[],"deny":["CN","RU"]}
+# {
+#   "domain": "gnzabe.com",
+#   "mode": "deny_only",
+#   "allow": [],
+#   "deny": ["CN","RU"],
+#   "enforced": true,
+#   "enforced_in": ["/etc/nginx/sites-available/gnzabe-apis.conf"]
+# }
 ```
+
+`enforced` is the field that matters. Rules can exist on disk with no vhost
+referencing them, so the status reports whether nginx is actually applying them
+and names the files where the include lives.
 
 ## Safety
 
@@ -143,11 +184,29 @@ The GeoIP2 module or its database is missing — see the prerequisite above. The
 agent detects this case and adds a hint to the error.
 
 **Rules exist but traffic is not blocked**
-Check the include actually landed in the vhost:
+Ask the agent whether it is enforcing:
 
 ```bash
-grep -r 'geo-servers' /etc/nginx/sites-available/
+curl localhost:8080/v1/geo/gnzabe.com/status
 ```
 
-If it is absent, the vhost did not exist when the rule was created. Re-send any
-geo request for that domain and the agent will add it.
+If `"enforced": false`, no server block includes the rule. Confirm directly:
+
+```bash
+grep -rn 'geo-servers' /etc/nginx/sites-available/ /etc/nginx/sites-enabled/
+```
+
+Re-send any geo request for the domain and the agent will add the include, or
+return 409 naming the problem if no block declares the domain.
+
+If `"enforced": true` but traffic still gets through, the rule is wired in and
+the cause is upstream: the GeoIP2 database is missing or is not resolving that
+visitor to the country you expect.
+
+**HTTP 409 "No nginx server block serves ..."**
+No `server_name` directive anywhere declares that domain. Check for a typo, or
+that the site is deployed:
+
+```bash
+grep -rn 'server_name' /etc/nginx/sites-enabled/
+```
