@@ -3,13 +3,78 @@ Security and authentication utilities for WAF Agent
 """
 
 import base64
+import ipaddress
 import logging
+import os
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.backends import default_backend
 from .config import PRIVATE_KEY_PATH
 
 logger = logging.getLogger(__name__)
+
+
+# Headers a reverse proxy adds when it forwards a request. If any are present,
+# request.client.host is the proxy's address rather than the real caller's, so
+# a loopback check would wrongly trust every remote client.
+_FORWARDING_HEADERS = (
+    "x-forwarded-for",
+    "x-real-ip",
+    "forwarded",
+    "x-forwarded-host",
+)
+
+
+def _is_loopback(host: str) -> bool:
+    """True when the address refers to this machine."""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+
+    # ::ffff:127.0.0.1 is an IPv4 address wearing an IPv6 costume; unwrap it
+    # because IPv6Address.is_loopback is only true for ::1.
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+
+    return address.is_loopback
+
+
+def is_trusted_local_request(request) -> bool:
+    """
+    Decide whether a request may skip the bearer token and signature.
+
+    Only requests originating on this same machine qualify. The backend applies
+    the mirror-image rule: it omits credentials only when WAF_AGENT_URL is a
+    loopback address, so the two sides agree on exactly one trusted case.
+
+    Returns False — meaning full credentials are required — whenever we cannot
+    be certain, specifically:
+
+    * WAF_AGENT_STRICT_AUTH is set, which forces credentials unconditionally.
+    * The request carries reverse-proxy forwarding headers. Behind a proxy on
+      localhost every request looks like loopback, so trusting the peer address
+      would hand an auth bypass to the whole internet.
+    * The peer address is missing or is anything other than loopback.
+    """
+    if os.getenv("WAF_AGENT_STRICT_AUTH", "").strip().lower() in ("1", "true", "yes"):
+        return False
+
+    for header in _FORWARDING_HEADERS:
+        if request.headers.get(header):
+            logger.warning(
+                "Refusing to treat request as local: %s header present, so the "
+                "peer address is a proxy rather than the real client.",
+                header,
+            )
+            return False
+
+    client = request.client
+    if client is None or not client.host:
+        return False
+
+    return _is_loopback(client.host)
 
 
 def load_private_key() -> rsa.RSAPrivateKey:

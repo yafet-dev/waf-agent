@@ -20,7 +20,7 @@ _parent_dir = _file_path.parent.parent
 if _file_path.parent.name == "src" and str(_parent_dir) not in sys.path:
     sys.path.insert(0, str(_parent_dir))
 
-from fastapi import FastAPI, HTTPException, Security, Query
+from fastapi import Depends, FastAPI, HTTPException, Request, Security, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Optional
@@ -29,6 +29,7 @@ from typing import List, Optional
 try:
     from .waf_toggle import toggle_waf_for_domain, get_waf_status_for_domain
     from .ip_block import ban_unban_ip, get_ip_block_status
+    from .security import is_trusted_local_request
     from .geo_control import (
         read_list,
         write_list_atomic,
@@ -42,6 +43,7 @@ except ImportError:
     # Fallback to absolute imports when running directly
     from src.waf_toggle import toggle_waf_for_domain, get_waf_status_for_domain
     from src.ip_block import ban_unban_ip, get_ip_block_status
+    from src.security import is_trusted_local_request
     from src.geo_control import (
         read_list,
         write_list_atomic,
@@ -62,13 +64,50 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="WAF Agent", version="1.0.0", description="WAF Agent with Geo Access Control")
 
 # Security
-security = HTTPBearer()
+#
+# auto_error=False so a missing Authorization header reaches our dependency
+# instead of being rejected by FastAPI first. require_auth() below decides
+# whether the omission is acceptable.
+security = HTTPBearer(auto_error=False)
+
+
+def require_auth(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(security),
+) -> bool:
+    """
+    Enforce the bearer token, except for requests originating on this machine.
+
+    A backend running on the same host reaches the agent over loopback, where
+    the request never touches a network, so requiring a shared token there is
+    setup friction with no security benefit. Every other caller must present
+    one.
+
+    Returns True when the caller was treated as local, so the endpoint can
+    apply the same relaxation to the payload signature.
+    """
+    if is_trusted_local_request(request):
+        return True
+
+    if credentials is None or not (credentials.credentials or "").strip():
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Not authenticated. A bearer token is required for non-local "
+                "requests. Only callers on this machine (loopback) may omit it."
+            ),
+        )
+
+    return False
+
 
 # Request/Response models
 class WAFToggleRequest(BaseModel):
     domain: str
     enabled: bool
-    signature: str  # Base64 encoded signature of the request
+    # Optional so a loopback caller can omit it; still mandatory for everyone
+    # else, which toggle_waf_for_domain() enforces via require_signature.
+    signature: Optional[str] = None
 
 
 class WAFToggleResponse(BaseModel):
@@ -134,13 +173,13 @@ async def geo_health_check():
 @app.post("/waf/toggle", response_model=WAFToggleResponse)
 async def toggle_waf(
     request: WAFToggleRequest,
-    authorization: HTTPAuthorizationCredentials = Security(security)
+    is_local: bool = Depends(require_auth)
 ):
     """
     Toggle ModSecurity on/off for a domain
-    
+
     This endpoint:
-    1. Verifies the request signature
+    1. Verifies the request signature (skipped for loopback callers)
     2. Updates the nginx config file
     3. Tests the configuration
     4. Reloads nginx
@@ -150,7 +189,8 @@ async def toggle_waf(
         result = toggle_waf_for_domain(
             domain=request.domain,
             enabled=request.enabled,
-            signature=request.signature
+            signature=request.signature,
+            require_signature=not is_local
         )
         return WAFToggleResponse(**result)
     except HTTPException:
@@ -184,7 +224,7 @@ async def get_waf_status(domain: str):
 @app.post("/ban", response_model=IPBanResponse)
 async def ban_ip(
     request: IPBanRequest,
-    authorization: HTTPAuthorizationCredentials = Security(security)
+    _auth: bool = Depends(require_auth)
 ):
     """
     Ban or unban an IP address for one or more domains
@@ -237,7 +277,7 @@ async def get_status():
 @app.post("/v1/geo/mode")
 async def set_geo_mode(
     request: GeoModeRequest,
-    authorization: HTTPAuthorizationCredentials = Security(security)
+    _auth: bool = Depends(require_auth)
 ):
     """
     Switch between allow_only and deny_only modes
@@ -279,7 +319,7 @@ async def set_geo_mode(
 @app.post("/v1/geo/allow")
 async def add_allow_country(
     request: GeoCountryRequest,
-    authorization: HTTPAuthorizationCredentials = Security(security)
+    _auth: bool = Depends(require_auth)
 ):
     """
     Add country to allow list
@@ -317,7 +357,7 @@ async def add_allow_country(
 async def remove_allow_country(
     country: str,
     force: bool = False,
-    authorization: HTTPAuthorizationCredentials = Security(security)
+    _auth: bool = Depends(require_auth)
 ):
     """
     Remove country from allow list
@@ -358,7 +398,7 @@ async def remove_allow_country(
 @app.post("/v1/geo/deny")
 async def add_deny_country(
     request: GeoCountryRequest,
-    authorization: HTTPAuthorizationCredentials = Security(security)
+    _auth: bool = Depends(require_auth)
 ):
     """
     Add country to deny list
@@ -395,7 +435,7 @@ async def add_deny_country(
 @app.delete("/v1/geo/deny/{country}")
 async def remove_deny_country(
     country: str,
-    authorization: HTTPAuthorizationCredentials = Security(security)
+    _auth: bool = Depends(require_auth)
 ):
     """
     Remove country from deny list

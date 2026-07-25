@@ -80,47 +80,65 @@ def update_modsecurity_status(config_content: str, enabled: bool) -> str:
     return updated_content
 
 
-def toggle_waf_for_domain(domain: str, enabled: bool, signature: str) -> dict:
+def toggle_waf_for_domain(
+    domain: str,
+    enabled: bool,
+    signature: str = None,
+    require_signature: bool = True
+) -> dict:
     """
     Toggle ModSecurity on/off for a domain
-    
+
     Args:
         domain: Domain name
         enabled: Whether to enable (True) or disable (False) ModSecurity
         signature: Base64 encoded signature for verification
-    
+        require_signature: When False, an absent signature is accepted. The
+            caller sets this only for loopback requests, which never cross a
+            network. A signature that IS supplied is always verified, even
+            locally, so a misconfigured key is never silently ignored.
+
     Returns:
         dict with status information
-    
+
     Raises:
         HTTPException: For various error conditions
     """
     # Validate input
     if not domain or not domain.strip():
         raise HTTPException(status_code=400, detail="Domain is required")
-    
-    if not signature or not signature.strip():
-        raise HTTPException(status_code=400, detail="Signature is required")
-    
+
+    has_signature = bool(signature and signature.strip())
+
+    if not has_signature:
+        if require_signature:
+            raise HTTPException(status_code=400, detail="Signature is required")
+        logger.info(
+            f"Local request for domain {domain}: no signature supplied, "
+            "skipping verification"
+        )
+
     # Prepare data for signature verification
     # Signature should be of: domain|enabled (as string, lowercase boolean)
     # Convert boolean to lowercase string to match signing format
     enabled_str = str(enabled).lower()  # "true" or "false"
-    data_to_verify = f"{domain}|{enabled_str}".encode('utf-8')
-    
+
     logger.info(f"Received request - Domain: {domain}, Enabled: {enabled} (type: {type(enabled)})")
-    logger.info(f"Data to verify: '{data_to_verify.decode('utf-8')}' (length: {len(data_to_verify)} bytes)")
-    logger.info(f"Signature (first 50 chars): {signature[:50]}...")
-    
-    # Verify signature
-    if not verify_signature(data_to_verify, signature):
-        logger.error(f"Signature verification failed for domain: {domain}")
-        logger.error(f"Expected data format: '{domain}|{enabled_str}'")
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid signature. Please check that the correct private key is being used."
-        )
-    
+
+    if has_signature:
+        data_to_verify = f"{domain}|{enabled_str}".encode('utf-8')
+        logger.info(f"Data to verify: '{data_to_verify.decode('utf-8')}' (length: {len(data_to_verify)} bytes)")
+        logger.info(f"Signature (first 50 chars): {signature[:50]}...")
+
+        # Verify signature
+        if not verify_signature(data_to_verify, signature):
+            logger.error(f"Signature verification failed for domain: {domain}")
+            logger.error(f"Expected data format: '{domain}|{enabled_str}'")
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid signature. Please check that the correct private key is being used."
+            )
+
     logger.info(f"Processing WAF toggle: domain={domain}, enabled={enabled}")
     
     # Get nginx config path

@@ -53,6 +53,39 @@ sudo bash scripts/install.sh
 - Root/sudo access (for nginx operations)
 - RSA key pair for encryption
 
+## Authentication
+
+Mutating endpoints require a bearer token and, for `/waf/toggle`, an RSA
+signature — **unless the caller is on this same machine**.
+
+| Caller's peer address | Bearer token | Signature |
+| --- | --- | --- |
+| Loopback (`127.x`, `::1`) | Optional | Optional |
+| Anything else, LAN included | **Required** | **Required** |
+
+A request arriving over loopback never touched a network interface, so a shared
+token adds setup friction without adding security. Every other caller must
+authenticate. The backend applies the mirror-image rule and only omits
+credentials when its `WAF_AGENT_URL` is a loopback address, so the two sides
+agree on exactly one credential-free case.
+
+A supplied signature is **always** verified, loopback included — a wrong key is
+never silently ignored, only an absent one is tolerated locally.
+
+Unauthenticated by design: `/health`, `/v1/geo/health`, `/waf/status/{domain}`,
+`/status`, `/v1/geo/status`. These are read-only.
+
+### Running behind a reverse proxy
+
+Behind a proxy every request appears to come from loopback, which would hand an
+auth bypass to the whole internet. Two protections:
+
+1. A request carrying `X-Forwarded-For`, `X-Real-IP`, `Forwarded`, or
+   `X-Forwarded-Host` is never treated as local.
+2. Set `WAF_AGENT_STRICT_AUTH=true` to require credentials from every caller,
+   loopback included. Use this whenever the agent is proxied — it only ever
+   tightens the policy.
+
 ## API Endpoints
 
 ### Health Check
@@ -64,12 +97,12 @@ GET /health
 ```bash
 POST /waf/toggle
 Content-Type: application/json
-Authorization: Bearer <token>
+Authorization: Bearer <token>     # omit only when calling over loopback
 
 {
   "domain": "example.com",
   "enabled": true,
-  "signature": "<base64_encoded_signature>"
+  "signature": "<base64_encoded_signature>"   # omit only when calling over loopback
 }
 ```
 
@@ -77,6 +110,17 @@ Authorization: Bearer <token>
 ```bash
 GET /waf/status/{domain}
 ```
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/ -v
+```
+
+`tests/test_auth_policy.py` locks in the authentication boundary described
+above. All nginx side effects are stubbed, so it needs no root and touches no
+real config.
 
 ## Development
 
